@@ -356,10 +356,10 @@ func TestConcurrentConsistency(t *testing.T) {
 			rng := rand.New(rand.NewSource(int64(7 + w))) // 每个 goroutine 独立随机源
 			for i := 0; i < 10; i++ {
 				j := &Job{
-					ID:       fmt.Sprintf("w%d-j%d", w, i),
-					Owner:    fmt.Sprintf("owner-%d", w%2),
-					Priority: rng.Intn(5),
-					Req:      Resources{CPU: 1 + rng.Intn(2)},
+					ID:         fmt.Sprintf("w%d-j%d", w, i),
+					Owner:      fmt.Sprintf("owner-%d", w%2),
+					Priority:   rng.Intn(5),
+					Req:        Resources{CPU: 1 + rng.Intn(2)},
 					ArrayIndex: -1,
 				}
 				_ = s.Submit(j)

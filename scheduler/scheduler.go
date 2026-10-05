@@ -16,6 +16,9 @@ var ErrUnknownJob = errors.New("scheduler: unknown job")
 // ErrJobNotRunning 表示对非运行中的作业执行了 Complete。
 var ErrJobNotRunning = errors.New("scheduler: job is not running")
 
+// ErrUnknownNode 表示操作的节点不存在。
+var ErrUnknownNode = errors.New("scheduler: unknown node")
+
 // Decision 记录一次调度判定，供日志与测试断言使用。
 type Decision struct {
 	JobID  string
@@ -282,9 +285,18 @@ func (s *Scheduler) scheduleOneLocked(j *Job, allowPreempt bool) Decision {
 func (s *Scheduler) preemptLocked(j *Job) (Decision, bool) {
 	var victims []*Job
 	for _, o := range s.jobs {
-		if o.State == StateRunning && o.Priority < j.Priority {
-			victims = append(victims, o)
+		if o.State != StateRunning || o.Priority >= j.Priority {
+			continue
 		}
+		if o.GroupID != "" {
+			// 组调度成员不作为抢占牺牲者，避免同组被撕裂成一半运行一半排队。
+			continue
+		}
+		if n, ok := s.cluster.Node(o.AssignedNode); !ok || n.State != NodeOnline {
+			// 维护/故障节点上的作业本就要被回收，抢占它们换不回可用容量。
+			continue
+		}
+		victims = append(victims, o)
 	}
 	if len(victims) == 0 {
 		return Decision{}, false
@@ -378,30 +390,174 @@ func (s *Scheduler) Complete(jobID string) error {
 	return nil
 }
 
-// FailNode 模拟节点故障：节点上作业的资源只释放一次，
-// 按有界重试重新入队或置为失败，不产生重复计数或状态丢失。
+// FailNode 模拟节点故障：节点不可用，其上作业的资源只释放一次。
+// 处理以"单个作业"或"整个作业组"为单元（组内有成员在故障节点上则整组一起处理，
+// 不会留下同组一半运行一半排队的中间态）；故障不做平滑迁移，
+// 整组按有界重试一起重排或一起失败，重试与最终结论组内一致。
+// 在线节点与维护未排空（Cordoned）的节点均可故障；后者经 RecoverNode
+// 恢复后仍回到 Cordoned，维护意图不因故障丢失。
 func (s *Scheduler) FailNode(nodeID string) ([]Decision, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	n, ok := s.cluster.Node(nodeID)
+	if !ok {
+		return nil, ErrUnknownNode
+	}
 	if !s.cluster.failNode(nodeID) {
-		return nil, fmt.Errorf("scheduler: cannot fail node %q (unknown or already down)", nodeID)
+		return nil, fmt.Errorf("scheduler: cannot fail node %q (state=%s, only Online/Cordoned can fail)",
+			nodeID, n.State)
 	}
-	// 收集该节点上的运行中作业，按 ID 排序保证判定顺序确定。
-	var affected []*Job
-	for _, j := range s.jobs {
-		if j.State == StateRunning && j.AssignedNode == nodeID {
-			affected = append(affected, j)
-		}
-	}
-	sort.Slice(affected, func(a, b int) bool { return affected[a].ID < affected[b].ID })
-
+	units := s.collectEvictUnitsLocked(nodeID)
 	var decisions []Decision
-	for _, j := range affected {
-		s.cluster.release(nodeID, j.Req) // 恰好释放一次
-		s.quota[j.Owner] = s.quota[j.Owner].Sub(j.Req)
-		decisions = append(decisions, s.requeueOrFailLocked(j, fmt.Sprintf("node %s failed", nodeID)))
+	for _, u := range units {
+		decisions = append(decisions, s.evictUnitLocked(u, false, fmt.Sprintf("node %s failed", nodeID))...)
 	}
 	return decisions, nil
+}
+
+// evictUnit 是资源回收与重定位的最小单元：单个作业，或同组的全部运行成员。
+type evictUnit struct {
+	groupID string // 空串表示单作业
+	members []*Job // 成员已按 ID 升序
+}
+
+// collectEvictUnitsLocked 收集某节点上所有运行中作业所涉及的搬迁单元：
+// 无组作业各自成单元；有组作业则把该组在任意在线节点上运行的全部成员纳入同一单元，
+// 保证作业组整体搬迁或整体等待。单元顺序按其最小成员 ID 升序，确定可复现。
+func (s *Scheduler) collectEvictUnitsLocked(nodeID string) []evictUnit {
+	// 先找出该节点上直接受影响的组 ID（非空）与单作业。
+	gangSeen := map[string]bool{}
+	var singleSeen []*Job
+	for _, j := range s.jobs {
+		if j.State != StateRunning || j.AssignedNode != nodeID {
+			continue
+		}
+		if j.GroupID != "" {
+			gangSeen[j.GroupID] = true
+		} else {
+			singleSeen = append(singleSeen, j)
+		}
+	}
+
+	type rawUnit struct {
+		key  string // 组 ID 或 "job:"+作业 ID，用于排序锚点
+		unit evictUnit
+	}
+	var raws []rawUnit
+	for g := range gangSeen {
+		var members []*Job
+		for _, j := range s.jobs {
+			if j.State == StateRunning && j.GroupID == g {
+				members = append(members, j)
+			}
+		}
+		sortJobs(members)
+		raws = append(raws, rawUnit{members[0].ID, evictUnit{groupID: g, members: members}})
+	}
+	for _, j := range singleSeen {
+		raws = append(raws, rawUnit{j.ID, evictUnit{members: []*Job{j}}})
+	}
+	sort.Slice(raws, func(a, b int) bool { return raws[a].key < raws[b].key })
+
+	units := make([]evictUnit, 0, len(raws))
+	for _, r := range raws {
+		units = append(units, r.unit)
+	}
+	return units
+}
+
+// evictUnitLocked 原子地回收并重定位一个搬迁单元。
+//   - 第一步：释放单元内全部成员的旧占用与配额——每个成员恰好释放一次；
+//   - migrate=true（维护排空）：在其他在线节点上对整组做试分配，全部成功才提交，
+//     否则回滚试分配并整组退回队列；迁移成功的成员保持 Running，配额总量不变；
+//   - migrate=false（节点故障）：不试迁移，直接整组退回队列。
+//
+// 退回队列时组内重试结论一致：全体成员都还有重试预算则一起重排（Retries 各 +1），
+// 否则整组一起失败。
+func (s *Scheduler) evictUnitLocked(u evictUnit, migrate bool, cause string) []Decision {
+	// 1. 释放旧位置：节点占用与配额成对扣减，恰好一次。
+	for _, m := range u.members {
+		s.cluster.release(m.AssignedNode, m.Req)
+		s.quota[m.Owner] = s.quota[m.Owner].Sub(m.Req)
+	}
+
+	// 2. 维护排空：尝试平滑迁移整组。
+	if migrate {
+		type trial struct {
+			job    *Job
+			nodeID string
+		}
+		var trials []trial
+		ok := true
+		for _, m := range u.members {
+			nodeID, placed := s.cluster.tryAllocate(m.Req)
+			if !placed {
+				ok = false
+				break
+			}
+			trials = append(trials, trial{m, nodeID})
+		}
+		if ok {
+			var decisions []Decision
+			for _, tr := range trials {
+				// 在新位置提交：置 Running 并计回配额，与上一步释放成对，
+				// 配额净变化为零，不发生漂移。
+				s.commitLocked(tr.job, tr.nodeID)
+				who := tr.job.ID
+				if u.groupID != "" {
+					who = u.groupID
+				}
+				decisions = append(decisions, Decision{tr.job.ID, "migrated",
+					fmt.Sprintf("%s: live-migrated %s to node %s with %+v (quota settled once)",
+						cause, who, tr.nodeID, tr.job.Req)})
+			}
+			return decisions
+		}
+		// 放不下：回滚本次试分配，旧位置已释放不恢复（节点正在排空/已故障）。
+		for _, tr := range trials {
+			s.cluster.release(tr.nodeID, tr.job.Req)
+		}
+	}
+
+	// 3. 退回队列：组内结论一致——要么全体重排，要么全体失败。
+	allHaveBudget := true
+	for _, m := range u.members {
+		if m.Retries+1 > m.MaxRetries {
+			allHaveBudget = false
+			break
+		}
+	}
+	var decisions []Decision
+	for _, m := range u.members {
+		m.AssignedNode = ""
+		m.Retries++
+		if !allHaveBudget {
+			m.State = StateFailed
+			who := m.ID
+			if u.groupID != "" {
+				who = u.groupID
+			}
+			decisions = append(decisions, Decision{m.ID, "failed",
+				fmt.Sprintf("%s and whole unit %s failed together: retries exhausted (%d/%d)",
+					cause, who, m.Retries, m.MaxRetries)})
+			continue
+		}
+		m.State = StatePending
+		s.queue.Push(m)
+		who := m.ID
+		if u.groupID != "" {
+			who = u.groupID
+		}
+		decisions = append(decisions, Decision{m.ID, "requeued",
+			fmt.Sprintf("%s, unit %s returned to queue together, retry %d/%d",
+				cause, who, m.Retries, m.MaxRetries)})
+	}
+	return decisions
+}
+
+// sortJobs 按作业 ID 升序排序（确定性处理顺序）。
+func sortJobs(jobs []*Job) {
+	sort.Slice(jobs, func(a, b int) bool { return jobs[a].ID < jobs[b].ID })
 }
 
 // RecoverNode 恢复节点为健康状态。
@@ -411,6 +567,95 @@ func (s *Scheduler) RecoverNode(nodeID string) error {
 	if !s.cluster.recoverNode(nodeID) {
 		return fmt.Errorf("scheduler: cannot recover node %q (unknown or already healthy)", nodeID)
 	}
+	return nil
+}
+
+// NodeState 返回节点当前的运维状态。
+func (s *Scheduler) NodeState(nodeID string) (NodeState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.cluster.Node(nodeID)
+	if !ok {
+		return NodeOnline, ErrUnknownNode
+	}
+	return n.State, nil
+}
+
+// BeginMaintenance 把节点切到维护（未排空）状态：节点不再接收新的调度，
+// 但已有作业原样保留并可正常完成。已处于维护/下线/故障的节点不能再次切入。
+func (s *Scheduler) BeginMaintenance(nodeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.cluster.Node(nodeID)
+	if !ok {
+		return ErrUnknownNode
+	}
+	if !s.cluster.cordon(nodeID) {
+		return fmt.Errorf("scheduler: cannot begin maintenance on node %q (state=%s, only Online nodes can be cordoned)",
+			nodeID, n.State)
+	}
+	return nil
+}
+
+// DrainNode 显式发起排空：仅对已切入维护（Cordoned）的节点有效。
+// 节点上的作业以"单个作业"或"整个作业组"为搬迁单元处理：
+// 先尝试把单元整体平滑迁移到其他在线节点（迁移不增减配额、不消耗重试），
+// 放不下则整组（或单作业）一起退回队列，按有界重试重排或整组失败。
+// 单元处理顺序、组内成员顺序均按 ID 升序，结论确定可复现。
+// 处理干净后节点转为 Drained（真正下线，无作业、无占用）。
+func (s *Scheduler) DrainNode(nodeID string) ([]Decision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.cluster.Node(nodeID)
+	if !ok {
+		return nil, ErrUnknownNode
+	}
+	if n.State != NodeCordoned {
+		return nil, fmt.Errorf("scheduler: cannot drain node %q (state=%s, drain requires Cordoned)", nodeID, n.State)
+	}
+
+	units := s.collectEvictUnitsLocked(nodeID)
+	var decisions []Decision
+	for _, u := range units {
+		decisions = append(decisions, s.evictUnitLocked(u, true, fmt.Sprintf("node %s drained", nodeID))...)
+	}
+	s.cluster.markDrained(nodeID)
+	decisions = append(decisions, Decision{JobID: nodeID, Action: "drained",
+		Reason: fmt.Sprintf("node %s is fully drained (units=%d) and now offline", nodeID, len(units))})
+	return decisions, nil
+}
+
+// CancelMaintenance 取消维护（仅排空开始前的 Cordoned 节点允许），
+// 节点立即恢复在线并重新参与调度；节点上保留的作业不受影响。
+func (s *Scheduler) CancelMaintenance(nodeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.cluster.Node(nodeID)
+	if !ok {
+		return ErrUnknownNode
+	}
+	if n.State != NodeCordoned {
+		return fmt.Errorf("scheduler: cannot cancel maintenance on node %q (state=%s, only Cordoned can cancel)",
+			nodeID, n.State)
+	}
+	s.cluster.uncordon(nodeID)
+	return nil
+}
+
+// EndMaintenance 结束已排空下线（Drained）节点的维护，节点恢复在线
+// 并在后续调度循环中重新参与调度。
+func (s *Scheduler) EndMaintenance(nodeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.cluster.Node(nodeID)
+	if !ok {
+		return ErrUnknownNode
+	}
+	if n.State != NodeDrained {
+		return fmt.Errorf("scheduler: cannot end maintenance on node %q (state=%s, only Drained can return)",
+			nodeID, n.State)
+	}
+	s.cluster.uncordon(nodeID)
 	return nil
 }
 
