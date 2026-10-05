@@ -16,6 +16,9 @@ var ErrUnknownJob = errors.New("scheduler: unknown job")
 // ErrJobNotRunning 表示对非运行中的作业执行了 Complete。
 var ErrJobNotRunning = errors.New("scheduler: job is not running")
 
+// ErrUnknownNode 表示操作的节点不存在。
+var ErrUnknownNode = errors.New("scheduler: unknown node")
+
 // Decision 记录一次调度判定，供日志与测试断言使用。
 type Decision struct {
 	JobID  string
@@ -282,9 +285,15 @@ func (s *Scheduler) scheduleOneLocked(j *Job, allowPreempt bool) Decision {
 func (s *Scheduler) preemptLocked(j *Job) (Decision, bool) {
 	var victims []*Job
 	for _, o := range s.jobs {
-		if o.State == StateRunning && o.Priority < j.Priority {
-			victims = append(victims, o)
+		if o.State != StateRunning || o.Priority >= j.Priority {
+			continue
 		}
+		// 维护中/已排空/故障节点上的作业不作为牺牲者：
+		// 抢占它们只会在不可调度的节点上释放空间，新作业仍无法落位。
+		if n, ok := s.cluster.Node(o.AssignedNode); !ok || n.State != NodeOnline {
+			continue
+		}
+		victims = append(victims, o)
 	}
 	if len(victims) == 0 {
 		return Decision{}, false
@@ -442,4 +451,15 @@ func (s *Scheduler) Pending() []string {
 		ids = append(ids, j.ID)
 	}
 	return ids
+}
+
+// NodeState 返回节点当前的运维状态；节点不存在时返回错误。
+func (s *Scheduler) NodeState(nodeID string) (NodeState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.cluster.Node(nodeID)
+	if !ok {
+		return NodeFailed, ErrUnknownNode
+	}
+	return n.State, nil
 }
